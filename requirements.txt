@@ -1,19 +1,12 @@
-# Pinned versions. These reflect what was current/stable as of this
-# codebase's development (early 2026) - they have NOT been checked
-# against live PyPI from this environment (no network access here).
-# Run `pip list --outdated` and `pip-audit` (see .github/workflows/
-# backend-ci.yml) for real, up-to-date vulnerability info before
-# deploying - pinning is a starting point for reproducibility, not a
-# substitute for actually scanning.
-
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-python-multipart==0.0.20
+fastapi==0.110.2
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
 pillow==11.0.0
-pydantic==2.10.4
-pydantic-settings==2.7.0
+pydantic==2.5.3
+pydantic-core==2.14.6
+pydantic-settings==2.3.4
 email-validator==2.2.0
 python-dotenv==1.0.1
 requests==2.32.3
@@ -22,12 +15,7 @@ cryptography==44.0.0
 redis==5.2.1
 httpx==0.28.1
 stripe==11.4.1
-sqlalchemy==2.0.36
-alembic==1.14.0
+sqlalchemy==2.0.27
+alembic==1.13.2
 asyncpg==0.30.0
 prometheus-fastapi-instrumentator==7.0.0
-
-# Windows-only, and requires the MT5 desktop terminal installed on the
-# same machine. Only install this in the worker-pool image/VM, not in
-# the main API image (see requirements-worker.txt).
-# MetaTrader5
