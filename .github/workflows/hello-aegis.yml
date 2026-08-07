@@ -1,1 +1,12 @@
+name: Hello AEGIS
 
+on:
+  workflow_dispatch:
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Say Hello
+        run: echo "Hello Augustine! GitHub Actions is working."
