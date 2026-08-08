@@ -12,7 +12,10 @@ on:
       - 'backend/**'
       - 'tests/**'
       - 'requirements*.txt'
+  workflow_dispatch:   # adds a manual "Run workflow" button in the Actions tab - re-run anytime without a new commit
   schedule:
+    # Weekly, independent of any code changes - new CVEs get published
+    # against already-pinned dependency versions all the time.
     - cron: '0 6 * * 1'
 
 jobs:
@@ -22,22 +25,19 @@ jobs:
     services:
       redis:
         image: redis:7
-        ports:
-          - 6379:6379
+        ports: ['6379:6379']
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-
       postgres:
         image: postgres:16
         env:
           POSTGRES_DB: aegis_test
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
+        ports: ['5432:5432']
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -45,56 +45,51 @@ jobs:
           --health-retries 5
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+        run: pip install -r requirements-dev.txt
 
       - name: Lint (ruff)
         run: |
           pip install ruff
           ruff check backend/app --select E9,F63,F7,F82 --exit-zero
+          # E9/F63/F7/F82 = syntax errors, undefined names, etc. Kept
+          # non-blocking (--exit-zero) until the codebase has a full lint
+          # pass - tighten this once that's done.
 
       - name: Dependency vulnerability scan (pip-audit)
         run: |
           pip install pip-audit
-          pip-audit --desc
+          pip-audit -r requirements.txt --desc
+          # Not --exit-zero: a known-vulnerable pinned dependency should
+          # fail the build. If this ever blocks a release you need to ship
+          # urgently, that's exactly the situation it's designed to force
+          # a conscious decision about, not silently skip.
 
       - name: Run tests
         env:
-          PYTHONPATH: ${{ github.workspace }}/backend
-          AEGIS_MASTER_KEY: dGVzdF9rZXlfMzJfYnl0ZXNfZXhhY3RseV8h
+          AEGIS_MASTER_KEY: dGVzdF9rZXlfMzJfYnl0ZXNfZXhhY3RseV8h  # test-only, not a real secret
           ADMIN_BOOTSTRAP_KEY: test-admin-key
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aegis_test
           REDIS_URL: redis://localhost:6379/0
-        run: |
-          pytest -v
+        run: pytest -v
 
       - name: Alembic migration check
         env:
-          PYTHONPATH: ${{ github.workspace }}/backend
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aegis_test
         working-directory: backend
-        run: |
-          alembic upgrade head
+        run: alembic upgrade head
 
   docker-build:
     runs-on: ubuntu-latest
     needs: test
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build image
-        run: |
-          docker build -f docker/Dockerfile -t aegis-api:ci .
+      - uses: actions/checkout@v4
+      - name: Build image (no push - just verify it builds)
+        run: docker build -f docker/Dockerfile -t aegis-api:ci .
