@@ -67,7 +67,7 @@ jobs:
       - name: Dependency vulnerability scan (pip-audit)
         run: |
           pip install pip-audit
-          pip-audit -r requirements.txt --desc
+          pip-audit --desc
 
       - name: Run tests
         env:
