@@ -1,8 +1,11 @@
 package com.aegis.mobile.capture
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -18,6 +21,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.aegis.mobile.R
 import com.aegis.mobile.data.HealthStatus
 import com.aegis.mobile.data.PrefKeys
@@ -49,6 +53,13 @@ class ScreenCaptureService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var cacheManager: ScreenshotCacheManager
 
+    // Defaults to "no crop" (send the full frame) until a real ROI is
+    // fetched - safe fallback if the config endpoint is unreachable, since
+    // sending too much is a bandwidth cost, sending too little could crop
+    // off real chart data the brain needs.
+    @Volatile private var captureTopPercent: Float = 0.0f
+    @Volatile private var captureBottomPercent: Float = 1.0f
+
     companion object {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
@@ -57,6 +68,7 @@ class ScreenCaptureService : Service() {
         private const val HEARTBEAT_INTERVAL = 60000L   // 1 minute - independent of the capture loop
         private const val CACHE_DRAIN_INTERVAL = 15000L // how often we try to flush the offline backlog
         private const val MAX_DRAIN_PER_CYCLE = 5        // catch up gradually, not in one burst, after reconnecting
+        private const val ROI_REFRESH_INTERVAL = 6 * 60 * 60 * 1000L  // 6 hours - config rarely changes
         private const val WAKELOCK_TIMEOUT_MS = 10000L  // safety cap so a stuck capture can't hold the lock forever
     }
 
@@ -88,9 +100,11 @@ class ScreenCaptureService : Service() {
 
         HealthStatus.mediaProjectionActive.postValue(true)
         setupVirtualDisplay()
+        scope.launch { refreshCaptureRoi() }
         handler.postDelayed(captureRunnable, CAPTURE_INTERVAL)
         handler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL)
         handler.postDelayed(cacheDrainRunnable, CACHE_DRAIN_INTERVAL)
+        handler.postDelayed(roiRefreshRunnable, ROI_REFRESH_INTERVAL)
         return START_STICKY
     }
 
@@ -124,6 +138,36 @@ class ScreenCaptureService : Service() {
         override fun run() {
             scope.launch { drainCache() }
             handler.postDelayed(this, CACHE_DRAIN_INTERVAL)
+        }
+    }
+
+    private val roiRefreshRunnable = object : Runnable {
+        override fun run() {
+            scope.launch { refreshCaptureRoi() }
+            handler.postDelayed(this, ROI_REFRESH_INTERVAL)
+        }
+    }
+
+    /**
+     * Fetches the capture crop bounds from the backend (single source of
+     * truth: colors_config.json's roi section) rather than hardcoding a
+     * copy in the app - so tightening the crop later is a config change,
+     * not an app update. Failure here just keeps whatever bounds were
+     * already in memory (defaults to "no crop" on first-ever failure) -
+     * capture must never block or fail because this fetch failed.
+     */
+    private suspend fun refreshCaptureRoi() {
+        try {
+            val response = apiService.getCaptureRoi()
+            if (response.isSuccessful) {
+                response.body()?.let {
+                    captureTopPercent = it.captureTopPercent
+                    captureBottomPercent = it.captureBottomPercent
+                    Log.d("AEGIS", "Capture ROI updated: $captureTopPercent - $captureBottomPercent")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("AEGIS", "Could not refresh capture ROI, keeping previous bounds: ${e.message}")
         }
     }
 
@@ -196,11 +240,13 @@ class ScreenCaptureService : Service() {
             bitmap.copyPixelsFromBuffer(buffer)
             image.close()
 
+            val croppedBitmap = applyRoiCrop(bitmap)
+
             scope.launch {
                 val accountId = resolveAccountId()
                 val tempFile = File(cacheDir, "live_capture_tmp.jpg")
                 FileOutputStream(tempFile).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
+                    croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
                 }
 
                 val sent = trySend(tempFile, accountId, capturedAtMs)
@@ -209,13 +255,30 @@ class ScreenCaptureService : Service() {
                     // drain loop will retry this (in correct chronological
                     // order relative to other cached frames) once connectivity
                     // returns.
-                    cacheManager.cache(bitmap, capturedAtMs, accountId)
+                    cacheManager.cache(croppedBitmap, capturedAtMs, accountId)
                     HealthStatus.pendingCacheCount.postValue(cacheManager.pendingCount())
                     updateNotification("Offline - ${cacheManager.pendingCount()} screenshots queued")
                 }
                 tempFile.delete()
             }
         }
+    }
+
+    /**
+     * Crops out anything above captureTopPercent or below captureBottomPercent
+     * (status bar, MT5 toolbar chrome, nav bar - whatever isn't part of the
+     * price/indicator panels). Currently a no-op with the default 0.0/1.0
+     * bounds until colors_config.json's roi values are tightened based on a
+     * real device measurement - see refreshCaptureRoi() and
+     * app/api/config_router.py on the backend for where these come from.
+     */
+    private fun applyRoiCrop(bitmap: Bitmap): Bitmap {
+        if (captureTopPercent <= 0.0f && captureBottomPercent >= 1.0f) {
+            return bitmap  // no-op fast path - avoids an unnecessary copy when there's nothing to crop
+        }
+        val top = (bitmap.height * captureTopPercent).toInt().coerceIn(0, bitmap.height - 1)
+        val bottom = (bitmap.height * captureBottomPercent).toInt().coerceIn(top + 1, bitmap.height)
+        return Bitmap.createBitmap(bitmap, 0, top, bitmap.width, bottom - top)
     }
 
     /**
@@ -304,9 +367,27 @@ class ScreenCaptureService : Service() {
             .build()
     }
 
+    /**
+     * On Android 13+ (TIRAMISU), posting a notification requires the runtime
+     * POST_NOTIFICATIONS permission. This only guards the *ongoing status update*
+     * notify() calls used to refresh the existing foreground notification's text
+     * (e.g. "Last signal: BUY @ 10:02:31") - it does not affect startForeground()
+     * in onCreate(), which the OS allows regardless so the foreground service
+     * itself can still run even if the user never grants notification access.
+     * If the permission isn't granted, we simply skip the update rather than
+     * crash or spam SecurityExceptions - the service keeps working either way,
+     * the user just won't see live status text in the notification shade.
+     */
+    @SuppressLint("NotificationPermission")
     private fun updateNotification(status: String) {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIF_ID, buildNotification(status))
+        val hasPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+
+        if (hasPermission) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(NOTIF_ID, buildNotification(status))
+        }
     }
 
     override fun onDestroy() {
@@ -314,6 +395,7 @@ class ScreenCaptureService : Service() {
         handler.removeCallbacks(captureRunnable)
         handler.removeCallbacks(heartbeatRunnable)
         handler.removeCallbacks(cacheDrainRunnable)
+        handler.removeCallbacks(roiRefreshRunnable)
         if (wakeLock?.isHeld == true) wakeLock?.release()
         virtualDisplay?.release()
         mediaProjection?.stop()
